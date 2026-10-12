@@ -272,7 +272,10 @@ where
                 if let Ok(response) = cmdauth2(*challenge_version, challenge, challenge1b)
                 {
                     info!("Challenge version: 0x{:x}", *challenge_version);
-                    let packet = build_packet(ResponseType::Ack as u8, &response);
+                    // PSP-1000 era syscons (versions 0x00-0x06) expect only the first 8 bytes,
+                    // as a genuine Sony battery sends
+                    let response_len = if *challenge_version <= 0x06 { 8 } else { 16 };
+                    let packet = build_packet(ResponseType::Ack as u8, &response[..response_len]);
                     self.send_packet(&packet.0, packet.1);
                 }
                 if *challenge_version == 0xeb || *challenge_version == 0xb3 {
@@ -306,7 +309,8 @@ where
 
 fn cmd_read_status() -> [u8;3] {
     info!("CmdReadStatus");
-    [0x10, 0xc3, 0x06]
+    // as captured from a genuine Sony battery; 0x10 0xc3 0x06 makes a PSP-1000 report a low battery
+    [0x00, 0xc3, 0x05]
 }
 
 fn cmd_read_temperature() -> [u8;1] {
@@ -875,7 +879,7 @@ mod tests {
         let _ = embedded_logger::StdLogger::init();
 
         let cmd_read_status_challenge_1 = [0x5A, 0x02, 0x01, 0xA2];
-        let cmd_read_status_response_1 = [0xA5, 0x05, 0x06, 0x10, 0xC3, 0x06, 0x76];
+        let cmd_read_status_response_1 = [0xA5, 0x05, 0x06, 0x00, 0xC3, 0x05, 0x87];
 
         let cmd_read_serialno_challenge_1 =  [0x5A, 0x02, 0x0C, 0x97];
         let cmd_read_serialno_response_1 = [0xA5, 0x06, 0x06, 0xFF, 0xFF, 0xFF, 0xFF, 0x52];
@@ -887,16 +891,16 @@ mod tests {
         let cmd_auth2_response_1 = [0xA5, 0x12, 0x06, 0xE2, 0x5C, 0x77, 0x67, 0x79, 0x1B, 0x58, 0x37, 0x31, 0x47, 0x7C, 0x8F, 0xC1, 0x6C, 0x6B, 0x5E, 0x8A];
 
         let cmd_read_status_challenge_2 = [0x5A, 0x02, 0x01, 0xA2];
-        let cmd_read_status_response_2 = [0xA5, 0x05, 0x06, 0x10, 0xC3, 0x06, 0x76];
+        let cmd_read_status_response_2 = [0xA5, 0x05, 0x06, 0x00, 0xC3, 0x05, 0x87];
 
         let cmd_read_serialno_challenge_2 = [0x5A, 0x02, 0x0C, 0x97];
         let cmd_read_serialno_response_2 = [0xA5, 0x06, 0x06, 0xFF, 0xFF, 0xFF, 0xFF, 0x52];
 
         let cmd_auth1_challenge_2 = [0x5A, 0x0B, 0x80, 0x02, 0x31, 0x4F, 0x1B, 0x2D, 0x89, 0x23, 0x38, 0x90, 0xDC];
-        let cmd_auth1_response_2 = [0xA5, 0x12, 0x06, 0x7D, 0x09, 0x36, 0xA5, 0x80, 0xBD, 0x0F, 0xB9, 0xBD, 0x48, 0x86, 0x24, 0x1E, 0xCE, 0x10, 0xD2, 0x5F];
+        let cmd_auth1_response_2 = [0xA5, 0x12, 0x06, 0xF3, 0x29, 0x40, 0x42, 0x35, 0x37, 0xD6, 0xCF, 0x00, 0xFE, 0xE8, 0xD2, 0x0B, 0xD8, 0x3D, 0x97, 0x24];
 
         let cmd_read_status_challenge_3 = [0x5A, 0x02, 0x01, 0xA2];
-        let cmd_read_status_response_3 = [0xA5, 0x05, 0x06, 0x10, 0xC3, 0x06, 0x76];
+        let cmd_read_status_response_3 = [0xA5, 0x05, 0x06, 0x00, 0xC3, 0x05, 0x87];
 
         let cmd_read_serialno_challenge_3 = [0x5A, 0x02, 0x0C, 0x97];
         let cmd_read_serialno_response_3 = [0xA5, 0x06, 0x06, 0xFF, 0xFF, 0xFF, 0xFF, 0x52];
@@ -976,7 +980,7 @@ mod tests {
                                   0xEA, 0xCD, 0x3A, 0x74, 0xD4, 0xD9, 0xA0, 0x69, 0x98, 0xF6];
 
         let cmdreadstatus_send = [0x5a, 0x02, 0x01, 0xa2];
-        let cmdreadstatus_response = [0xa5, 0x05, 0x06, 0x10, 0xc3, 0x06, 0x76];
+        let cmdreadstatus_response = [0xa5, 0x05, 0x06, 0x00, 0xc3, 0x05, 0x87];
 
         use embedded_hal_mock::eh0::{serial, timer, digital, delay};
 
@@ -1025,5 +1029,69 @@ mod tests {
     #[test]
     fn test_cmdauth1_invalid_version() {
         assert!(cmdauth1(0x55, &[0x00; 1]).is_err());
+    }
+
+    // Exchanges sniffed between a PSP-1001 (key version 0x00) and a genuine Sony battery,
+    // from https://github.com/mdjarv/Baryon_ESPer/blob/main/docs/PSP-1001-debugging.md
+    // The second half of a genuine 0x80 reply is the battery's own nonce, so only the first
+    // half can be compared; the 0x81 reply is derived from that nonce.
+
+    #[test]
+    fn test_genuine_psp1000_cmdauth1() {
+        let _ = embedded_logger::StdLogger::init();
+        let captures = [
+            ([0xE1, 0xBC, 0xF9, 0x27, 0x48, 0x31, 0xB3, 0x90], [0x92, 0x50, 0x93, 0x09, 0xBA, 0x80, 0x6F, 0xB2]),
+            ([0xBE, 0xD3, 0xE3, 0x35, 0x97, 0x5F, 0x08, 0x4D], [0x39, 0x00, 0x08, 0x7B, 0x53, 0xE7, 0x62, 0x0E]),
+        ];
+        for (challenge, expected) in captures {
+            let (packet, _) = cmdauth1(0x00, &challenge).unwrap();
+            assert_eq!(expected, packet[0..8]);
+        }
+    }
+
+    #[test]
+    fn test_ehal_mock_genuine_psp1000_cmdauth2() {
+        use embedded_time::duration::Milliseconds;
+        use embedded_hal_mock::eh0::{serial, timer, digital, delay};
+        let _ = embedded_logger::StdLogger::init();
+
+        let captures = [
+            (
+                [0xBE, 0x97, 0xDA, 0x6B, 0x46, 0x34, 0xFA, 0x94],
+                [0x5A, 0x0A, 0x81, 0x01, 0x29, 0x83, 0x2D, 0x8B, 0xEF, 0xE2, 0xBA, 0x2A],
+                [0xA5, 0x0A, 0x06, 0x5B, 0xB1, 0x18, 0x83, 0xB9, 0x40, 0xA1, 0xEF, 0x1A],
+            ),
+            (
+                [0x47, 0x0D, 0x95, 0x35, 0xE4, 0xE6, 0x6C, 0x8B],
+                [0x5A, 0x0A, 0x81, 0xB9, 0xF8, 0x5F, 0x16, 0xC9, 0x31, 0xBE, 0x74, 0xC8],
+                [0xA5, 0x0A, 0x06, 0x4A, 0x91, 0x5D, 0x59, 0xB2, 0x36, 0x88, 0xDF, 0x6A],
+            ),
+        ];
+        for (battery_nonce, challenge, expected_response) in captures {
+            let clock = timer::MockClock::new();
+            let mut timer = clock.get_timer();
+            let led_expectations = [
+                digital::Transaction::set(digital::State::Low),
+                digital::Transaction::set(digital::State::High),
+            ];
+            let mut led = digital::Mock::new(&led_expectations);
+            let timeout = Milliseconds::new(500);
+            let mut delay = delay::NoopDelay::new();
+
+            let transactions = [
+                serial::Transaction::read_many(challenge),
+                serial::Transaction::write_many(expected_response),
+            ];
+            let mut ser = serial::Mock::new(&transactions);
+
+            let mut bs = BaryonSweeper::new(&mut ser, &mut timer, &mut led, timeout, &mut delay);
+            let mut length = 0;
+            let mut challenge_version = 0x00;
+            let mut challenge1b = [0u8; 16];
+            challenge1b[0..8].copy_from_slice(&battery_nonce);
+            bs.sweep_iter(&mut length, &mut challenge_version, &mut challenge1b);
+            ser.done();
+            led.done();
+        }
     }
 }
