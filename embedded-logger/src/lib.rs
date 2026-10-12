@@ -41,13 +41,15 @@ cfg_if::cfg_if! {
                         let mut log = self.log_buffer.borrow_ref_mut(cs);
                         let mut usb = self.usb_serial.borrow_ref_mut(cs);
                         let _ = write!(log, "{}: {}\r\n", record.level().as_str(), record.args());
+                        // Never wait for the host: with interrupts off the USB buffer can only
+                        // drain if a host is reading, so drop whatever doesn't fit
                         let mut count = 0;
                         while count < log.len() {
                             match usb.write(&log.as_bytes()[count..]) {
-                                Ok(c) => {
+                                Ok(c) if c > 0 => {
                                     count += c;
                                 }
-                                Err(_) => {}
+                                _ => break,
                             };
                         }
                         let _ = log.clear();

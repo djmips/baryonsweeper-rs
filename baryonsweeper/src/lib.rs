@@ -135,29 +135,68 @@ where
                 recv[i as usize] = res.unwrap();
             }
         }
-       
-        
+    }
+
+    fn log_received_packet(recv: &[u8], len: u8) {
         //#[cfg(debug_assertions)]
         //{
+            let length = len as usize + 1;
             let mut msg = heapless::String::<2048>::new();
             let _ = ufmt::uwrite!(msg, "Received packet: 0x5A, 0x{:02X} ", length).unwrap();
-            let _ = msg.write_str(fmt_packet(recv, length.into()).as_str());
+            let _ = msg.write_str(fmt_packet(recv, length).as_str());
             debug!("{}", msg.as_str());
         //}
     }
 
+    // The data line is a single wire (TX through a diode onto RX), so every byte sent comes
+    // straight back on RX. Read each echo before sending the next byte: this keeps our own
+    // replies out of receive_packet. A byte that comes back different or garbled means the PSP
+    // was driving the line at the same time, so stop. If the first byte doesn't come back the
+    // wiring has no loopback, so send the rest without waiting.
+    fn send_packet(&mut self, packet: &[u8], size: usize)
+    where
+    T: core::convert::From<TimeoutType>, <C as CountDown>::Time: From<T>
+    {
+        let mut expect_echo = true;
+        let mut collision_at = None;
+        for i in 0..size {
+            let _ = block!(self.serial.write(packet[i])).map_err(|_|());
+            if !expect_echo {
+                continue;
+            }
+            // one byte at 19200 baud 8E1 takes 573 us
+            cfg_if::cfg_if! {
+                if #[cfg(feature="std")] {
+                    use embedded_time::duration::Milliseconds;
+                    let echo = self.read_with_timeout(Milliseconds::new(5).into());
+                } else {
+                    let echo = self.read_with_timeout(TimeoutType::millis(5).into());
+                }
+            }
+            match echo {
+                Ok(byte) if byte == packet[i] => {},
+                // nothing came back on the first byte: no loopback on this wiring
+                Err(_) if i == 0 => expect_echo = false,
+                // a different byte, or a framing/parity error from both sides driving the line
+                _ => {
+                    collision_at = Some(i);
+                    break;
+                },
+            }
+        }
 
-    fn send_packet(&mut self, packet: &[u8], size: usize) {
-        //#[cfg(debug_assertions)] 
+        //#[cfg(debug_assertions)]
         //{
             let mut msg = heapless::String::<2048>::new();
             let _ = ufmt::uwrite!(msg, "Sending packet: ");
             let _ = msg.write_str(fmt_packet(packet, size).as_str());
             debug!("{}", msg.as_str());
         //}
-        
-        for i in 0..size {
-            let _ = block!(self.serial.write(packet[i])).map_err(|_|());
+        if let Some(i) = collision_at {
+            info!("Echo mismatch at byte {} of {}, stopped sending", i, size);
+        }
+        if !expect_echo {
+            info!("No echo on RX, is TX looped back through a diode?");
         }
     }
 
@@ -279,8 +318,13 @@ where
                     self.send_packet(&packet.0, packet.1);
                 }
                 if *challenge_version == 0xeb || *challenge_version == 0xb3 {
+                    // a read status request onto our own line; it used to be answered when its
+                    // echo came back as a request, now send_packet eats the echo so answer it here
                     let packet2 = [0x5a, 0x02, 0x01, 0xa2];
                     self.send_packet(&packet2, packet2.len());
+                    let response = cmd_read_status();
+                    let packet = build_packet(ResponseType::Ack as u8, &response);
+                    self.send_packet(&packet.0, packet.1);
                 }
             },
             Ok(Commands::CmdAuthGo) => {
@@ -301,6 +345,9 @@ where
                     info!("Sending General NAK!");
             }           
         }
+
+        // logged after replying so a slow log can't make the reply late
+        Self::log_received_packet(&recv, *length);
 
         self.led_pin.set_high().map_err(|_|()).unwrap();
         self.delay.delay_ms(1);
@@ -608,6 +655,13 @@ enum ResponseType {
 mod tests {
     use super::*;
 
+    // what the serial port sees when we send `packet` on the looped-back line:
+    // each byte written comes straight back on RX
+    fn echoed(packet: &[u8]) -> Vec<embedded_hal_mock::eh0::serial::Transaction<u8>> {
+        use embedded_hal_mock::eh0::serial::Transaction;
+        packet.iter().flat_map(|b| [Transaction::write(*b), Transaction::read(*b)]).collect()
+    }
+
     #[test]
     fn test_challenge_response_cmdauth1() {
         let _ = embedded_logger::StdLogger::init();
@@ -914,43 +968,32 @@ mod tests {
         let cmdauthgo_challenge = [0x5A, 0x2A, 0x90, 0x20, 0x10, 0x00, 0x06, 0x82, 0x82, 0x82, 0x82, 0xCB, 0xA3, 0xDB, 0xAC, 0x00, 0xDF, 0x26, 0xF8, 0xDD, 0x5B, 0x0D, 0xAC, 0x91, 0x9A, 0xCF, 0x0B, 0x63, 0x26, 0x06, 0x18, 0xE6, 0x30, 0x4F, 0xDF, 0xE1, 0x6C, 0xEE, 0xA5, 0x16, 0x4E, 0x94, 0x15, 0xED];
         let cmdauthgo_response = [0xA5, 0x2A, 0x06, 0x20, 0x01, 0x00, 0x00, 0x82, 0x82, 0x82, 0x82, 0x82, 0x62, 0xDA, 0xD6, 0x79, 0x3C, 0x82, 0x92, 0x50, 0xEB, 0xC8, 0x86, 0x37, 0x23, 0x49,0x49,0xF5, 0xE6, 0x97, 0xC2, 0xF0, 0x76, 0x05, 0x73, 0xD7, 0x59, 0x2D, 0xC6, 0xE5, 0x27,0x5F,0x6D,0x22];
 
-        let transactions = [
-            serial::Transaction::read_many(cmd_read_status_challenge_1),
-            serial::Transaction::write_many(cmd_read_status_response_1), 
+        let mut transactions = Vec::new();
+        transactions.push(serial::Transaction::read_many(cmd_read_status_challenge_1));
+        transactions.extend(echoed(&cmd_read_status_response_1));
+        transactions.push(serial::Transaction::read_many(cmd_read_serialno_challenge_1));
+        transactions.extend(echoed(&cmd_read_serialno_response_1));
+        transactions.push(serial::Transaction::read_many(cmd_auth1_challenge_1));
+        transactions.extend(echoed(&cmd_auth1_response_1));
+        transactions.push(serial::Transaction::read_many(cmd_auth2_challenge_1));
+        transactions.extend(echoed(&cmd_auth2_response_1));
+        transactions.push(serial::Transaction::read_many(cmd_read_status_challenge_2));
+        transactions.extend(echoed(&cmd_read_status_response_2));
+        transactions.push(serial::Transaction::read_many(cmd_read_serialno_challenge_2));
+        transactions.extend(echoed(&cmd_read_serialno_response_2));
+        transactions.push(serial::Transaction::read_many(cmd_auth1_challenge_2));
+        transactions.extend(echoed(&cmd_auth1_response_2));
+        transactions.push(serial::Transaction::read_many(cmd_read_status_challenge_3));
+        transactions.extend(echoed(&cmd_read_status_response_3));
+        transactions.push(serial::Transaction::read_many(cmd_read_serialno_challenge_3));
+        transactions.extend(echoed(&cmd_read_serialno_response_3));
+        transactions.push(serial::Transaction::read_many(cmd_auth1_challenge_3));
+        transactions.extend(echoed(&cmd_auth1_response_3));
+        transactions.push(serial::Transaction::read_many(cmd_auth2_challenge_3));
+        transactions.extend(echoed(&cmd_auth2_response_3));
+        transactions.push(serial::Transaction::read_many(cmdauthgo_challenge));
+        transactions.extend(echoed(&cmdauthgo_response));
 
-            serial::Transaction::read_many(cmd_read_serialno_challenge_1),
-            serial::Transaction::write_many(cmd_read_serialno_response_1), 
-
-            serial::Transaction::read_many(cmd_auth1_challenge_1),
-            serial::Transaction::write_many(cmd_auth1_response_1), 
-
-            serial::Transaction::read_many(cmd_auth2_challenge_1),
-            serial::Transaction::write_many(cmd_auth2_response_1), 
-
-            serial::Transaction::read_many(cmd_read_status_challenge_2),
-            serial::Transaction::write_many(cmd_read_status_response_2), 
-
-            serial::Transaction::read_many(cmd_read_serialno_challenge_2),
-            serial::Transaction::write_many(cmd_read_serialno_response_2), 
-
-            serial::Transaction::read_many(cmd_auth1_challenge_2),
-            serial::Transaction::write_many(cmd_auth1_response_2), 
-
-            serial::Transaction::read_many(cmd_read_status_challenge_3),
-            serial::Transaction::write_many(cmd_read_status_response_3), 
-
-            serial::Transaction::read_many(cmd_read_serialno_challenge_3),
-            serial::Transaction::write_many(cmd_read_serialno_response_3), 
-
-            serial::Transaction::read_many(cmd_auth1_challenge_3),
-            serial::Transaction::write_many(cmd_auth1_response_3), 
-
-            serial::Transaction::read_many(cmd_auth2_challenge_3),
-            serial::Transaction::write_many(cmd_auth2_response_3), 
-
-            serial::Transaction::read_many(cmdauthgo_challenge),
-            serial::Transaction::write_many(cmdauthgo_response), 
-        ];
         let mut ser = serial::Mock::new(&transactions);
 
         let mut bs = BaryonSweeper::new(&mut ser, &mut timer, &mut led, timeout, &mut delay);
@@ -991,8 +1034,6 @@ mod tests {
             digital::Transaction::set(digital::State::High),
             digital::Transaction::set(digital::State::Low),
             digital::Transaction::set(digital::State::High),
-            digital::Transaction::set(digital::State::Low),
-            digital::Transaction::set(digital::State::High),
         ];
         let mut led = digital::Mock::new(&led_expectations);
         let timeout = Milliseconds::new(500);
@@ -1001,16 +1042,13 @@ mod tests {
 
         let _ = embedded_logger::StdLogger::init();
 
-        let serial_transactions = [
-            serial::Transaction::read_many(cmdauth1_challenge),
-            serial::Transaction::write_many(cmdauth1_response),
-            serial::Transaction::read_many(cmdauth2_challenge),
-            serial::Transaction::write_many(cmdauth2_response),
-            serial::Transaction::write_many(cmdreadstatus_send),
-            serial::Transaction::read_many(cmdreadstatus_send),
-            serial::Transaction::write_many(cmdreadstatus_response),
-            serial::Transaction::read_many([]),
-        ];
+        // after challenge 2 for 0xEB it puts a read status request on the line and answers it
+        let mut serial_transactions = vec![serial::Transaction::read_many(cmdauth1_challenge)];
+        serial_transactions.extend(echoed(&cmdauth1_response));
+        serial_transactions.push(serial::Transaction::read_many(cmdauth2_challenge));
+        serial_transactions.extend(echoed(&cmdauth2_response));
+        serial_transactions.extend(echoed(&cmdreadstatus_send));
+        serial_transactions.extend(echoed(&cmdreadstatus_response));
 
         let mut ser = serial::Mock::new(&serial_transactions);
 
@@ -1018,7 +1056,7 @@ mod tests {
         let mut length = 0;
         let mut challenge_version = 0;
         let mut challenge1b = [0u8; 16];
-        for _ in 0..3 {
+        for _ in 0..2 {
             bs.sweep_iter(&mut length, &mut  challenge_version, &mut challenge1b);
         }
         ser.done();
@@ -1029,6 +1067,42 @@ mod tests {
     #[test]
     fn test_cmdauth1_invalid_version() {
         assert!(cmdauth1(0x55, &[0x00; 1]).is_err());
+    }
+
+    #[test]
+    fn test_ehal_mock_echo_collision_stops_sending() {
+        use embedded_time::duration::Milliseconds;
+        use embedded_hal_mock::eh0::{serial, timer, digital, delay};
+        let _ = embedded_logger::StdLogger::init();
+
+        let clock = timer::MockClock::new();
+        let mut timer = clock.get_timer();
+        let led_expectations = [
+            digital::Transaction::set(digital::State::Low),
+            digital::Transaction::set(digital::State::High),
+        ];
+        let mut led = digital::Mock::new(&led_expectations);
+        let timeout = Milliseconds::new(500);
+        let mut delay = delay::NoopDelay::new();
+
+        // the second byte of the status reply comes back changed: nothing more is sent
+        let cmd_read_status_challenge = [0x5A, 0x02, 0x01, 0xA2];
+        let transactions = [
+            serial::Transaction::read_many(cmd_read_status_challenge),
+            serial::Transaction::write(0xA5),
+            serial::Transaction::read(0xA5),
+            serial::Transaction::write(0x05),
+            serial::Transaction::read(0x01),
+        ];
+        let mut ser = serial::Mock::new(&transactions);
+
+        let mut bs = BaryonSweeper::new(&mut ser, &mut timer, &mut led, timeout, &mut delay);
+        let mut length = 0;
+        let mut challenge_version = 0;
+        let mut challenge1b = [0u8; 16];
+        bs.sweep_iter(&mut length, &mut challenge_version, &mut challenge1b);
+        ser.done();
+        led.done();
     }
 
     // Exchanges sniffed between a PSP-1001 (key version 0x00) and a genuine Sony battery,
@@ -1078,10 +1152,8 @@ mod tests {
             let timeout = Milliseconds::new(500);
             let mut delay = delay::NoopDelay::new();
 
-            let transactions = [
-                serial::Transaction::read_many(challenge),
-                serial::Transaction::write_many(expected_response),
-            ];
+            let mut transactions = vec![serial::Transaction::read_many(challenge)];
+            transactions.extend(echoed(&expected_response));
             let mut ser = serial::Mock::new(&transactions);
 
             let mut bs = BaryonSweeper::new(&mut ser, &mut timer, &mut led, timeout, &mut delay);
